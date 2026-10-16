@@ -186,7 +186,7 @@ if uploaded_files:
                         escreva um breve relatório executivo em português (máximo de 3 parágrafos) destacando pontos de atenção financeira, saúde do fluxo de caixa e recomendações para a PME.
                         """
                         resp_relatorio = client.models.generate_content(
-                            model='gemini-2.5-flash',
+                            model='gemini-3.8-flash',
                             contents=resumo_prompt
                         )
                         relatorio_texto = resp_relatorio.text
