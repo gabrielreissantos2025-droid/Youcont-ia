@@ -34,12 +34,6 @@ if uploaded_files:
                     for uploaded_file in uploaded_files:
                         bytes_data = uploaded_file.getvalue()
                         
-                        # Enviar arquivo para a API do Gemini
-                        arquivo_enviado = client.files.upload(
-                            file=bytes_data,
-                            config=dict(mime_type=uploaded_file.type)
-                        )
-
                         prompt = """
                         Você é um assistente de contabilidade especialista em conciliação bancária e PMEs.
                         Analise este documento financeiro e extraia todos os lançamentos financeiros encontrados.
@@ -55,7 +49,13 @@ if uploaded_files:
 
                         resposta = client.models.generate_content(
                             model='gemini-2.5-flash',
-                            contents=[arquivo_enviado, prompt],
+                            contents=[
+                                types.Part.from_bytes(
+                                    data=bytes_data,
+                                    mime_type=uploaded_file.type,
+                                ),
+                                prompt
+                            ],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json"
                             ),
@@ -125,3 +125,4 @@ if uploaded_files:
 
             except Exception as e:
                 st.error(f"Ocorreu um erro ao processar os arquivos: {e}")
+                    
