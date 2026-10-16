@@ -48,7 +48,7 @@ if uploaded_files:
                         """
 
                         resposta = client.models.generate_content(
-                            model='gemini-2.5-flash',
+                            model='gemini-3.8-flash',
                             contents=[
                                 types.Part.from_bytes(
                                     data=bytes_data,
