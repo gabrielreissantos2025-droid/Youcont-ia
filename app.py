@@ -1,252 +1,620 @@
-import streamlit as st
-import pandas as pd
+Import hashlib
+import html
 import json
+import os
 import re
-from datetime import date
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-# Configuração da página
+# =============================================================
+# CONFIGURAÇÃO
+# =============================================================
+
+
+def ler_secret(nome: str, padrao=None):
+    try:
+        return st.secrets[nome]
+    except Exception:
+        return os.environ.get(nome, padrao)
+
+
+MODELO_GEMINI = ler_secret("MODELO_GEMINI", "gemini-2.5-flash")
+DB_PATH = Path(ler_secret("DB_PATH", "dados_auditoria/auditoria.db"))
+MAX_UPLOAD_MB = 20
+
 st.set_page_config(
-    page_title="Agente Contábil Profissional - Produção", 
-    page_icon="💼", 
-    layout="wide"
+    page_title="Agente Contábil Profissional - Auditoria",
+    page_icon="💼",
+    layout="wide",
 )
 
-st.title("💼 Agente Contábil Profissional & Auditoria (B2B)")
-st.markdown("Plataforma contábil com validação rigorosa (Pydantic), integridade matemática de saldos e conformidade de segurança.")
+st.title("💼 Agente Contábil Profissional & Auditoria")
+st.markdown(
+    "Livro contábil persistido em SQLite, deduplicação por chave única, trilha de auditoria "
+    "append-only com hash encadeado, quarentena de itens rejeitados e revisão humana registrada."
+)
 
-# Configuração segura de credenciais via st.secrets (Obrigatório em produção)
-api_key = None
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
+MIME_POR_EXTENSAO = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".ofx": "text/plain",
+}
 
-with st.sidebar:
-    st.header("⚙️ Configurações & Governança")
-    if not api_key:
-        api_key = st.text_input("Insira sua Google Gemini API Key", type="password")
-        st.warning("⚠️ Insira a chave no st.secrets ou aqui para iniciar.")
-    else:
-        st.success("🔒 Credencial carregada via st.secrets com segurança.")
-    
-    st.markdown("---")
-    aviso_lgpd = st.checkbox("Concordo com o envio de documentos para análise externa via IA", value=True)
-    mascarar_dados = st.checkbox("Mascarar Dados Sensíveis (LGPD - Pós-extração)", value=True)
-    st.info("ℹ️ Os documentos são processados em memória volátil e descartados após o encerramento.")
+MAGIC_BYTES = {
+    ".pdf": b"%PDF-",
+    ".png": b"\x89PNG\r\n\x1a\n",
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+}
 
-# Definição do Esquema Rigoroso com Pydantic para validação da IA
+# =============================================================
+# BANCO DE DADOS (SQLite)
+# =============================================================
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS lancamentos (
+    lancamento_id      TEXT PRIMARY KEY,
+    chave_dedup        TEXT NOT NULL UNIQUE,
+    arquivo_hash       TEXT NOT NULL,
+    data               TEXT NOT NULL,
+    data_iso           TEXT NOT NULL,
+    descricao_original TEXT NOT NULL,
+    valor_centavos     INTEGER NOT NULL CHECK (valor_centavos >= 0),
+    tipo               TEXT NOT NULL CHECK (tipo IN ('CREDITO', 'DEBITO')),
+    categoria          TEXT NOT NULL,
+    origem             TEXT NOT NULL,
+    requer_revisao     INTEGER NOT NULL DEFAULT 1,
+    criado_em          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS arquivos_ia (
+    arquivo_hash  TEXT PRIMARY KEY,
+    nome          TEXT,
+    processado_em TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quarentena (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    arquivo      TEXT,
+    arquivo_hash TEXT,
+    item_json    TEXT,
+    erro_json    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auditoria_log (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                    TEXT NOT NULL,
+    evento                TEXT NOT NULL,
+    arquivo               TEXT,
+    hash_sha256           TEXT,
+    tipo                  TEXT,
+    status                TEXT,
+    total                 INTEGER,
+    consentimento_externo INTEGER,
+    destino               TEXT,
+    detalhe               TEXT,
+    usuario               TEXT,
+    hash_anterior         TEXT NOT NULL,
+    hash_registro         TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS auditoria_log_sem_update
+BEFORE UPDATE ON auditoria_log
+BEGIN SELECT RAISE(ABORT, 'auditoria_log é append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS auditoria_log_sem_delete
+BEFORE DELETE ON auditoria_log
+BEGIN SELECT RAISE(ABORT, 'auditoria_log é append-only'); END;
+"""
+
+CAMPOS_LOG = (
+    "ts",
+    "evento",
+    "arquivo",
+    "hash_sha256",
+    "tipo",
+    "status",
+    "total",
+    "consentimento_externo",
+    "destino",
+    "detalhe",
+    "usuario",
+)
+
+
+def agora() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def conectar() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def transacao():
+    """Transação com BEGIN IMMEDIATE: serializa escritas e mantém a cadeia de hash íntegra."""
+    conn = conectar()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def inicializar_banco():
+    conn = conectar()
+    try:
+        conn.executescript(SCHEMA_SQL)
+    finally:
+        conn.close()
+
+
+def _hash_registro(anterior: str, registro: dict) -> str:
+    corpo = json.dumps(registro, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(f"{anterior}|{corpo}".encode("utf-8")).hexdigest()
+
+
+def registrar_log(conn: sqlite3.Connection, **campos):
+    """Acrescenta um registro à trilha, encadeado ao hash do registro anterior."""
+    registro = {c: campos.get(c) for c in CAMPOS_LOG}
+    registro["ts"] = registro["ts"] or agora()
+    if registro["total"] is not None:
+        registro["total"] = int(registro["total"])
+    if registro["consentimento_externo"] is not None:
+        registro["consentimento_externo"] = int(bool(registro["consentimento_externo"]))
+
+    linha = conn.execute(
+        "SELECT hash_registro FROM auditoria_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    anterior = linha[0] if linha else "GENESIS"
+    hash_reg = _hash_registro(anterior, registro)
+
+    colunas = ", ".join(CAMPOS_LOG) + ", hash_anterior, hash_registro"
+    marcadores = ", ".join("?" for _ in range(len(CAMPOS_LOG) + 2))
+    conn.execute(
+        f"INSERT INTO auditoria_log ({colunas}) VALUES ({marcadores})",
+        [*registro.values(), anterior, hash_reg],
+    )
+
+
+def verificar_cadeia() -> tuple[bool, int | None, int]:
+    """Recalcula a cadeia. Retorna (íntegra, id do primeiro registro adulterado, total)."""
+    conn = conectar()
+    try:
+        linhas = conn.execute(
+            f"SELECT id, {', '.join(CAMPOS_LOG)}, hash_anterior, hash_registro "
+            "FROM auditoria_log ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    anterior = "GENESIS"
+    for id_, *valores, hash_ant, hash_reg in linhas:
+        registro = dict(zip(CAMPOS_LOG, valores))
+        if hash_ant != anterior or _hash_registro(anterior, registro) != hash_reg:
+            return False, id_, len(linhas)
+        anterior = hash_reg
+    return True, None, len(linhas)
+
+
+def inserir_lancamentos(conn: sqlite3.Connection, lancamentos: list[dict]) -> tuple[int, int]:
+    """INSERT OR IGNORE: a chave UNIQUE faz a deduplicação. Retorna (inseridos, ignorados)."""
+    inseridos = 0
+    for l in lancamentos:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO lancamentos
+            (lancamento_id, chave_dedup, arquivo_hash, data, data_iso, descricao_original,
+             valor_centavos, tipo, categoria, origem, requer_revisao, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                l["lancamento_id"],
+                l["chave_dedup"],
+                l["arquivo_hash"],
+                l["data"],
+                datetime.strptime(l["data"], "%d/%m/%Y").strftime("%Y-%m-%d"),
+                l["descricao_original"],
+                l["valor"],
+                l["tipo"],
+                l["categoria"],
+                l["origem"],
+                agora(),
+            ),
+        )
+        inseridos += cur.rowcount
+    return inseridos, len(lancamentos) - inseridos
+
+
+def arquivo_ia_ja_processado(arquivo_hash: str) -> bool:
+    conn = conectar()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM arquivos_ia WHERE arquivo_hash = ?", (arquivo_hash,)
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def carregar_livro() -> pd.DataFrame:
+    conn = conectar()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT lancamento_id, arquivo_hash, data, descricao_original,
+                   valor_centavos AS valor, tipo, categoria, origem, requer_revisao
+            FROM lancamentos ORDER BY data_iso, rowid
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if df.empty:
+        return df
+
+    df["requer_revisao"] = df["requer_revisao"].astype(bool)
+    df["valor"] = df["valor"].astype("int64")
+    df["valor_assinado"] = np.where(df["tipo"] == "CREDITO", df["valor"], -df["valor"])
+    df["possivel_duplicata"] = df.duplicated(
+        subset=["data", "valor", "tipo", "descricao_original"], keep=False
+    )
+    return df
+
+
+def versao_livro() -> str:
+    conn = conectar()
+    try:
+        n, maximo = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM lancamentos"
+        ).fetchone()
+    finally:
+        conn.close()
+    return f"{n}_{maximo}"
+
+
+def carregar_log(limite: int = 500) -> pd.DataFrame:
+    conn = conectar()
+    try:
+        return pd.read_sql_query(
+            "SELECT id, ts, evento, arquivo, tipo, status, total, destino, usuario, "
+            "substr(hash_registro, 1, 12) AS hash_registro "
+            "FROM auditoria_log ORDER BY id DESC LIMIT ?",
+            conn,
+            params=(limite,),
+        )
+    finally:
+        conn.close()
+
+
+def carregar_quarentena() -> pd.DataFrame:
+    conn = conectar()
+    try:
+        return pd.read_sql_query(
+            "SELECT id, ts, arquivo, item_json, erro_json FROM quarentena ORDER BY id DESC",
+            conn,
+        )
+    finally:
+        conn.close()
+
+
+# =============================================================
+# FIM DO BLOCO DE BANCO
+# =============================================================
+
+
+def inicializar_estado():
+    for chave, padrao in {"erro_revisao": None}.items():
+        if chave not in st.session_state:
+            st.session_state[chave] = padrao
+
+
+inicializar_estado()
+inicializar_banco()
+
+
+# =============================================================
+# VALIDAÇÃO PYDANTIC
+# =============================================================
+
 class LancamentoSchema(BaseModel):
     data: str = Field(..., description="Data no formato DD/MM/AAAA")
-    descricao: str = Field(..., description="Descrição detalhada da transação financeira")
-    valor: float = Field(..., description="Valor absoluto numérico da transação (positivo)")
-    tipo: Literal["CREDITO", "DEBITO"] = Field(..., description="Tipo da transação: CREDITO ou DEBITO")
+    descricao: str = Field(..., description="Descrição da transação")
+    valor: float = Field(..., ge=0, description="Valor absoluto, positivo ou zero")
+    tipo: Literal["CREDITO", "DEBITO"]
     categoria: Literal[
-        "Investimentos", 
-        "Transferências", 
-        "Impostos", 
-        "Fornecedores", 
-        "Despesas Operacionais", 
-        "Outros"
-    ] = Field(..., description="Categoria contábil normalizada")
+        "Investimentos",
+        "Transferências",
+        "Impostos",
+        "Fornecedores",
+        "Despesas Operacionais",
+        "Outros",
+    ]
+
+    @field_validator("data")
+    @classmethod
+    def validar_data(cls, valor: str) -> str:
+        datetime.strptime(valor, "%d/%m/%Y")
+        return valor
+
 
 class RelatorioContabilSchema(BaseModel):
     lancamentos: list[LancamentoSchema]
 
-# Parser OFX Robusto e com Tratamento de Erros
-def parse_ofx(file_bytes):
-    try:
-        content = file_bytes.decode('utf-8', errors='ignore')
-        ofx_data = content[content.index('<OFX>'):] if '<OFX>' in content else content
-        lancamentos = []
-        transacoes = re.findall(r'<STMTTRN>(.*?)</STMTTRN>', ofx_data, re.DOTALL)
-        
-        for t in transacoes:
-            try:
-                data_match = re.search(r'<DTPOSTED>(.*?)([+\[]|$)', t)
-                val_match = re.search(r'<TRNAMT>(.*?)</TRNAMT>', t)
-                memo_match = re.search(r'<MEMO>(.*?)</MEMO>', t)
-                name_match = re.search(r'<NAME>(.*?)</NAME>', t)
-                
-                if val_match and data_match:
-                    # Substituir vírgula por ponto para conversão decimal segura
-                    val_str = val_match.group(1).strip().replace(',', '.')
-                    valor = float(val_str)
-                    tipo = "CREDITO" if valor >= 0 else "DEBITO"
-                    
-                    dt_raw = data_match.group(1).strip()
-                    data_fmt = f"{dt_raw[6:8]}/{dt_raw[4:6]}/{dt_raw[0:4]}" if len(dt_raw) >= 8 else date.today().strftime("%d/%m/%Y")
-                    
-                    desc = memo_match.group(1).strip() if memo_match else (name_match.group(1).strip() if name_match else "Transação OFX")
-                    
-                    cat = "Transferências" if valor < 0 else "Outros"
-                    if "INVEST" in desc.upper() or "B3" in desc.upper():
-                        cat = "Investimentos"
-                    elif "IMPOSTO" in desc.upper() or "IOF" in desc.upper():
-                        cat = "Impostos"
 
-                    lancamentos.append({
-                        "data": data_fmt,
-                        "descricao": desc,
-                        "valor": abs(valor),
-                        "tipo": tipo,
-                        "categoria": cat
-                    })
-            except Exception:
-                continue # Ignora transações mal formatadas isoladamente
-        return lancamentos
-    except Exception as e:
-        st.error(Ocorreu um erro crítico ao ler o ficheiro OFX: {e})
-        return []
+# =============================================================
+# UTILITÁRIOS E SEGURANÇA (LGPD & CSV INJECTION)
+# =============================================================
 
-# Função de mascaramento LGPD melhorada
-def aplicar_mascara_lgpd(texto):
+def calcular_hash_arquivo(bytes_arquivo: bytes) -> str:
+    return hashlib.sha256(bytes_arquivo).hexdigest()
+
+
+def validar_conteudo(extensao: str, bytes_arquivo: bytes) -> bool:
+    assinatura = MAGIC_BYTES.get(extensao)
+    return assinatura is None or bytes_arquivo.startswith(assinatura)
+
+
+def aplicar_mascara_lgpd(texto: str) -> str:
     if not isinstance(texto, str):
         return texto
-    # Mascarar CPFs e CNPJs com ou sem pontuação básica
-    texto_mascarado = re.sub(r'\d{3}\.\d{3}\.\d{3}-\d{2}', '***.***.***-**', texto)
-    texto_mascarado = re.sub(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', '**.***.***/****-**', texto_mascarado)
-    texto_mascarado = re.sub(r'\b\d{11}\b', '***********', texto_mascarado) # CPF cru
-    return texto_mascarado
 
-uploaded_files = st.file_uploader(
-    "📂 Selecione os extratos e comprovantes (PDF, Imagens, OFX):", 
-    type=["pdf", "png", "jpg", "jpeg", "ofx"], 
-    accept_multiple_files=True
-)
+    texto = re.sub(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", "***.***.***-**", texto)
+    texto = re.sub(r"\b\d{11}\b", "***********", texto)
+    texto = re.sub(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b", "**.***.***/****-**", texto)
+    texto = re.sub(r"\b\d{14}\b", "**************", texto)
+    texto = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "****@****.***", texto)
+    return texto
 
-if uploaded_files:
-    if not aviso_lgpd:
-        st.warning("⚠️ Deve concordar com os termos de privacidade na barra lateral para prosseguir com o processamento.")
-    else:
-        st.success(f"✨ {len(uploaded_files)} ficheiro(s) carregado(s) com sucesso em memória volátil.")
 
-        if st.button("🚀 Executar Auditoria e Processamento Contábil", type="primary"):
-            if not api_key:
-                st.error("⚠️ Chave da API do Gemini não configurada.")
-            else:
+def neutralizar_csv_injection(texto: str) -> str:
+    if isinstance(texto, str) and texto.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + texto
+    return texto
+
+
+def sanitizar_erro(exc: Exception) -> str:
+    return re.sub(r"[^\w\s.,-]", "", str(exc))[:100]
+
+
+def normalizar_decimal(texto: str) -> str:
+    """Aceita '1234.56', '1234,56', '1.234,56' e '1,234.56'."""
+    texto = texto.strip().replace(" ", "")
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            return texto.replace(".", "").replace(",", ".")
+        return texto.replace(",", "")
+    return texto.replace(",", ".")
+
+
+def valor_para_centavos(valor_str: str) -> int:
+    dec = Decimal(normalizar_decimal(valor_str))
+    return int((dec * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def centavos_para_float(centavos: int) -> float:
+    return float(Decimal(int(centavos)) / Decimal(100))
+
+
+def formatar_brl(centavos: int) -> str:
+    sinal = "-" if centavos < 0 else ""
+    c = abs(int(centavos))
+    reais = f"{c // 100:,}".replace(",", ".")
+    return f"{sinal}R$ {reais},{c % 100:02d}"
+
+
+def decodificar_texto_ofx(bytes_arquivo: bytes) -> str:
+    try:
+        return bytes_arquivo.decode("utf-8")
+    except UnicodeDecodeError:
+        return bytes_arquivo.decode("cp1252", errors="replace")
+
+
+def criar_lancamento(
+    arquivo_hash: str,
+    chave_dedup: str,
+    data: str,
+    descricao: str,
+    valor_centavos: int,
+    tipo: str,
+    categoria: str,
+    origem: str,
+) -> dict:
+    return {
+        "lancamento_id": str(uuid.uuid4()),
+        "chave_dedup": chave_dedup,
+        "arquivo_hash": arquivo_hash,
+        "data": data,
+        "descricao_original": html.unescape(descricao),
+        "valor": valor_centavos,
+        "tipo": tipo,
+        "categoria": categoria,
+        "origem": origem,
+    }
+
+
+# =============================================================
+# PARSER OFX (SGML v1 + XML v2, várias contas por arquivo)
+# =============================================================
+
+def parse_ofx(bytes_arquivo: bytes, arquivo_hash: str):
+    """Retorna (lancamentos, erros, avisos, duplicados_no_arquivo)."""
+    lancamentos: list[dict] = []
+    erros: list[str] = []
+    avisos: list[str] = []
+    chaves_locais: set[str] = set()
+    dups_locais = 0
+    aviso_metadados = False
+
+    try:
+        conteudo = decodificar_texto_ofx(bytes_arquivo)
+        corpo = conteudo[conteudo.index("<OFX>"):] if "<OFX>" in conteudo else conteudo
+
+        blocos = [
+            m.group(2)
+            for m in re.finditer(r"<(STMTRS|CCSTMTRS)>(.*?)</\1>", corpo, re.DOTALL)
+        ] or [corpo]
+
+        indice = 0
+        for bloco in blocos:
+            bank_m = re.search(r"<BANKID>([^<\r\n]+)", bloco)
+            acct_m = re.search(r"<ACCTID>([^<\r\n]+)", bloco)
+            bank_id = bank_m.group(1).strip() if bank_m else "UNKNOWN_BANK"
+            acct_id = acct_m.group(1).strip() if acct_m else "UNKNOWN_ACCT"
+
+            if (bank_id.startswith("UNKNOWN_") or acct_id.startswith("UNKNOWN_")) and not aviso_metadados:
+                aviso_metadados = True
+                avisos.append(
+                    "Metadados bancários incompletos (comum em cartão); "
+                    "deduplicação baseada em FITID/hash de conteúdo."
+                )
+
+            transacoes = re.findall(
+                r"<STMTTRN>(.*?)(?=<STMTTRN>|</BANKTRANLIST>|</STMTTRN>|$)",
+                bloco,
+                re.DOTALL,
+            )
+            ocorrencias: dict[str, int] = {}
+
+            for transacao in transacoes:
+                indice += 1
                 try:
-                    client = genai.Client(api_key=api_key)
-                    todos_lancamentos = []
-                    auditoria_logs = []
+                    data_m = re.search(r"<DTPOSTED>(\d{8})", transacao)
+                    valor_m = re.search(r"<TRNAMT>([^<\r\n]+)", transacao)
+                    memo_m = re.search(r"<MEMO>([^<\r\n]+)", transacao)
+                    nome_m = re.search(r"<NAME>([^<\r\n]+)", transacao)
+                    fitid_m = re.search(r"<FITID>([^<\r\n]+)", transacao)
 
-                    with st.spinner("🤖 A executar pipeline de extração e validação estruturada..."):
-                        for uploaded_file in uploaded_files:
-                            bytes_data = uploaded_file.getvalue()
-                            file_name = uploaded_file.name
-                            
-                            if file_name.endswith('.ofx'):
-                                lanc_ofx = parse_ofx(bytes_data)
-                                if lanc_ofx:
-                                    todos_lancamentos.extend(lanc_ofx)
-                                    auditoria_logs.append({"arquivo": file_name, "tipo": "OFX (Local)", "status": "Sucesso", "total": len(lanc_ofx)})
-                                else:
-                                    auditoria_logs.append({"arquivo": file_name, "tipo": "OFX (Local)", "status": "Falha/Vazio", "total": 0})
-                            else:
-                                prompt = """
-                                Analise este documento financeiro e extraia rigorosamente todos os lançamentos financeiros.
-                                Respeite escrupulosamente os tipos de dados exigidos pelo esquema estruturado.
-                                """
+                    if not data_m or not valor_m:
+                        raise ValueError("Transação sem DTPOSTED ou TRNAMT válido.")
 
-                                resposta = client.models.generate_content(
-                                    model='gemini-3.8-flash',
-                                    contents=[
-                                        types.Part.from_bytes(data=bytes_data, mime_type=uploaded_file.type),
-                                        prompt
-                                    ],
-                                    config=types.GenerateContentConfig(
-                                        response_mime_type="application/json",
-                                        response_schema=RelatorioContabilSchema,
-                                    ),
-                                )
+                    data_bruta = data_m.group(1)
+                    data_fmt = f"{data_bruta[6:8]}/{data_bruta[4:6]}/{data_bruta[0:4]}"
+                    datetime.strptime(data_fmt, "%d/%m/%Y")
 
-                                dados_json = json.loads(resposta.text)
-                                if "lancamentos" in dados_json:
-                                    todos_lancamentos.extend(dados_json["lancamentos"])
-                                    auditoria_logs.append({"arquivo": file_name, "tipo": "IA (Gemini)", "status": "Sucesso", "total": len(dados_json["lancamentos"])})
-                                else:
-                                    auditoria_logs.append({"arquivo": file_name, "tipo": "IA (Gemini)", "status": "Sem lançamentos", "total": 0})
+                    valor_bruto = valor_m.group(1).strip()
+                    centavos = valor_para_centavos(valor_bruto)
+                    tipo = "CREDITO" if centavos >= 0 else "DEBITO"
 
-                    if todos_lancamentos:
-                        df = pd.DataFrame(todos_lancamentos)
-                        df['valor'] = pd.to_numeric(df['valor'], errors='coerce').fillna(0.0)
+                    descricao = (
+                        memo_m.group(1).strip()
+                        if memo_m
+                        else nome_m.group(1).strip()
+                        if nome_m
+                        else "Transação OFX"
+                    )
 
-                        # Correção Contábil Matemática do Sinal (Valor Assinado)
-                        df['valor_assinado'] = df.apply(
-                            lambda row: row['valor'] if str(row['tipo']).upper() == 'CREDITO' else -row['valor'],
-                            axis=1
-                        )
-
-                        # Aplicar LGPD se ativado
-                        if mascarar_dados:
-                            df['descricao'] = df['descricao'].apply(aplicar_mascara_lgpd)
-
-                        st.markdown("---")
-                        st.subheader("📊 Painel de Controlo & Métricas Contábeis")
-
-                        total_creditos = df.loc[df['tipo'].str.upper() == 'CREDITO', 'valor'].sum()
-                        total_debitos = df.loc[df['tipo'].str.upper() == 'DEBITO', 'valor'].sum()
-                        saldo_liquido = df['valor_assinado'].sum() # Cálculo matemático correto
-
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("📈 Total de Créditos", f"R$ {total_creditos:,.2f}")
-                        c2.metric("📉 Total de Débitos", f"R$ {total_debitos:,.2f}")
-                        c3.metric("💰 Saldo Líquido Consolidado", f"R$ {saldo_liquido:,.2f}")
-                        c4.metric("📋 Transações Auditadas", len(df))
-
-                        # Trilha de Auditoria Visível
-                        with st.expander("🔍 Ver Relatório de Trilha de Auditoria por Ficheiro"):
-                            st.dataframe(pd.DataFrame(auditoria_logs), use_container_width=True)
-
-                        st.markdown("---")
-                        st.subheader("📈 Distribuição Financeira por Categoria")
-                        
-                        df_grafico = df.groupby('categoria')['valor'].sum()
-                        if not df_grafico.empty:
-                            st.bar_chart(df_grafico)
-
-                        st.markdown("---")
-                        st.subheader("🔍 Filtros e Livro de Lançamentos")
-
-                        col_f1, col_f2 = st.columns(2)
-                        with col_f1:
-                            filtro_tipo = st.selectbox("Filtrar por Tipo", ["Todos", "CREDITO", "DEBITO"])
-                        with col_f2:
-                            categorias_disponiveis = ["Todas"] + list(df['categoria'].unique())
-                            filtro_cat = st.selectbox("Filtrar por Categoria", categorias_disponiveis)
-
-                        df_filtrado = df.copy()
-                        if filtro_tipo != "Todos":
-                            df_filtrado = df_filtrado[df_filtrado['tipo'].str.upper() == filtro_tipo]
-                        if filtro_cat != "Todas":
-                            df_filtrado = df_filtrado[df_filtrado['categoria'] == filtro_cat]
-
-                        # Exibir tabela limpa sem mostrar a coluna técnica interna de cálculo
-                        tabela_exibicao = df_filtrado.drop(columns=['valor_assinado'])
-                        st.dataframe(tabela_exibicao, use_container_width=True)
-
-                        st.markdown("---")
-                        col_d1, col_d2 = st.columns(2)
-                        
-                        # Exportação correta para Excel/Sheets (encoding utf-8-sig e separador ;)
-                        csv = df_filtrado.drop(columns=['valor_assinado']).to_csv(index=False, sep=";", encoding='utf-8-sig').encode('utf-8-sig')
-                        col_d1.download_button(
-                            label="📥 Descarregar CSV (Compatível com Excel)",
-                            data=csv,
-                            file_name='livro_contabil_auditado.csv',
-                            mime='text/csv',
-                        )
-
-                        json_str = df_filtrado.drop(columns=['valor_assinado']).to_json(orient="records", force_ascii=False, date_format="iso")
-                        col_d2.download_button(
-                            label="📥 Descarregar JSON Estruturado",
-                            data=json_str,
-                            file_name='livro_contabil_auditado.json',
-                            mime='application/json',
-                        )
+                    if fitid_m:
+                        chave = f"{bank_id}|{acct_id}|{fitid_m.group(1).strip()}"
                     else:
-                        st.warning("⚠️ Nenhum lançamento válido foi identificado nos ficheiros submetidos.")
+                        sig = f"{data_bruta}|{centavos}|{descricao}"
+                        ocorrencias[sig] = ocorrencias.get(sig, 0) + 1
+                        h = hashlib.sha256(
+                            f"{bank_id}|{acct_id}|{sig}|{ocorrencias[sig]}".encode()
+                        ).hexdigest()
+                        chave = f"{bank_id}|{acct_id}|HASH-{h}"
 
-                except Exception as e:
-                    st.error(f"❌ Erro crítico no motor contábil: {e}")
+                    if chave in chaves_locais:
+                        dups_locais += 1
+                        continue
+
+                    categoria = "Outros"
+                    desc_up = descricao.upper()
+                    if "INVEST" in desc_up or re.search(r"\bB3\b", desc_up):
+                        categoria = "Investimentos"
+                    elif "IMPOSTO" in desc_up or "IOF" in desc_up:
+                        categoria = "Impostos"
+
+                    lancamentos.append(
+                        criar_lancamento(
+                            arquivo_hash=arquivo_hash,
+                            chave_dedup=chave,
+                            data=data_fmt,
+                            descricao=descricao,
+                            valor_centavos=abs(centavos),
+                            tipo=tipo,
+                            categoria=categoria,
+                            origem="OFX local",
+                        )
+                    )
+                    chaves_locais.add(chave)
+
+                except Exception as erro:
+                    erros.append(f"Transação {indice}: {erro}")
+
+        return lancamentos, erros, avisos, dups_locais
+
+    except Exception as erro:
+        return [], [f"Erro crítico ao interpretar OFX: {erro}"], avisos, 0
+
+
+# =============================================================
+# EXTRAÇÃO POR IA (Gemini)
+# =============================================================
+
+PROMPT_EXTRACAO = """
+Analise este documento financeiro e extraia todos os lançamentos com precisão absoluta.
+Não invente lançamentos. Se não houver transações claras, retorne lista vazia.
+Ignore linhas de saldo, totais e subtotais.
+Datas no formato DD/MM/AAAA. O valor é sempre absoluto (positivo).
+Saídas são DEBITO e entradas são CREDITO.
+Respeite estritamente o esquema JSON solicitado.
+"""
+
+
+def chamar_gemini(client, bytes_data: bytes, mime_tipo: str):
+    ultimo_erro = None
+    for tentativa in range(3):
+        try:
+            return client.models.generate_content(
+                model=MODELO_GEMINI,
+                contents=[
+                    types.Part.from_bytes(data=bytes_data, mime_type=mime_tipo),
+                    PROMPT_EXTRACAO,
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=RelatorioContabilSchema,
+                    temperature=0.0,
+                ),
+            )
+        except Exception as exc:
+            ultimo_erro = exc
+            if tentativa < 2:
+                time.sleep(2 ** tentativa)
+    raise ultimo_erro
+
+
+# =============================================================
+# PIPELINE POR ARQUIVO
+# =============================================================
+
+def novo_resultado(nome: str, arquivo_hash: str) -> dict:
+    return {
+        "arquivo": nome,
+        "hash": arq
