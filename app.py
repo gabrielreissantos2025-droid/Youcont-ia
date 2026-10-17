@@ -1,52 +1,34 @@
 import hashlib
 import html
 import json
-import os
 import re
 import secrets
-import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, field_validator
 
-# =============================================================
-# CONFIGURAÇÃO
-# =============================================================
-
-def ler_secret(nome: str, padrao=None):
-    try:
-        return st.secrets[nome]
-    except Exception:
-        return os.environ.get(nome, padrao)
-
-
-MODELO_GEMINI = ler_secret("MODELO_GEMINI", "gemini-2.5-flash")
-DB_PATH = Path(ler_secret("DB_PATH", "dados_auditoria/auditoria.db"))
-MAX_UPLOAD_MB = 20
-PBKDF2_ITERACOES = 390_000
-
-st.set_page_config(
-    page_title="Agente Contábil Multiempresa",
-    page_icon="💼",
-    layout="wide",
+from db import (
+    POOL,
+    agora,
+    formatar_brl,
+    hash_senha,
+    inicializar_banco,
+    normalizar_decimal,
+    registrar_log,
+    transacao,
+    valor_para_centavos,
+    verificar_cadeia,
 )
 
-st.title("💼 Agente Contábil Multiempresa & Auditoria")
-st.markdown(
-    "Plataforma multiempresa para escritórios contábeis: clientes isolados, "
-    "documentos rastreáveis, deduplicação por tenant e trilha auditável."
-)
+MODELO_GEMINI = st.secrets.get("MODELO_GEMINI", "gemini-2.5-flash")
 
 MIME_POR_EXTENSAO = {
     ".pdf": "application/pdf",
@@ -65,306 +47,35 @@ MAGIC_BYTES = {
     ".jpeg": b"ÿØÿ",
 }
 
-# =============================================================
-# BANCO DE DADOS MULTIEMPRESA
-# =============================================================
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id   TEXT PRIMARY KEY,
-    nome        TEXT NOT NULL,
-    cnpj        TEXT UNIQUE,
-    criado_em   TEXT NOT NULL,
-    ativo       INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS usuarios (
-    usuario_id       TEXT PRIMARY KEY,
-    tenant_id        TEXT NOT NULL REFERENCES tenants(tenant_id),
-    email            TEXT NOT NULL,
-    nome             TEXT NOT NULL,
-    papel            TEXT NOT NULL CHECK (
-        papel IN ('ADMIN', 'CONTADOR', 'ASSISTENTE', 'LEITURA')
-    ),
-    senha_salt       TEXT NOT NULL,
-    senha_hash       TEXT NOT NULL,
-    criado_em        TEXT NOT NULL,
-    ativo            INTEGER NOT NULL DEFAULT 1,
-    UNIQUE (tenant_id, email)
-);
-
-CREATE TABLE IF NOT EXISTS clientes (
-    cliente_id  TEXT PRIMARY KEY,
-    tenant_id   TEXT NOT NULL REFERENCES tenants(tenant_id),
-    razao_social TEXT NOT NULL,
-    nome_fantasia TEXT,
-    cnpj        TEXT,
-    criado_em   TEXT NOT NULL,
-    ativo       INTEGER NOT NULL DEFAULT 1,
-    UNIQUE (tenant_id, cnpj)
-);
-
-CREATE TABLE IF NOT EXISTS usuario_clientes (
-    tenant_id   TEXT NOT NULL,
-    usuario_id  TEXT NOT NULL REFERENCES usuarios(usuario_id),
-    cliente_id  TEXT NOT NULL REFERENCES clientes(cliente_id),
-    PRIMARY KEY (tenant_id, usuario_id, cliente_id),
-    FOREIGN KEY (tenant_id, cliente_id)
-        REFERENCES clientes(tenant_id, cliente_id)
-);
-
-CREATE TABLE IF NOT EXISTS contas_financeiras (
-    conta_id    TEXT PRIMARY KEY,
-    tenant_id   TEXT NOT NULL,
-    cliente_id  TEXT NOT NULL,
-    instituicao TEXT NOT NULL,
-    tipo        TEXT NOT NULL CHECK (
-        tipo IN ('BANCO', 'CARTAO', 'CAIXA', 'INVESTIMENTO', 'OUTRO')
-    ),
-    agencia     TEXT,
-    numero_conta TEXT,
-    moeda       TEXT NOT NULL DEFAULT 'BRL',
-    criado_em   TEXT NOT NULL,
-    ativo       INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY (tenant_id, cliente_id)
-        REFERENCES clientes(tenant_id, cliente_id),
-    UNIQUE (tenant_id, cliente_id, instituicao, agencia, numero_conta)
-);
-
-CREATE TABLE IF NOT EXISTS documentos (
-    documento_id   TEXT PRIMARY KEY,
-    tenant_id      TEXT NOT NULL,
-    cliente_id     TEXT NOT NULL,
-    origem         TEXT NOT NULL CHECK (
-        origem IN ('UPLOAD', 'WHATSAPP', 'EMAIL', 'API')
-    ),
-    tipo_documento TEXT NOT NULL CHECK (
-        tipo_documento IN (
-            'EXTRATO', 'NFE', 'RECIBO', 'COMPROVANTE',
-            'INFORME_RENDIMENTOS', 'FATURA', 'OUTRO'
-        )
-    ),
-    nome_arquivo   TEXT NOT NULL,
-    arquivo_hash   TEXT NOT NULL,
-    mime_type      TEXT NOT NULL,
-    tamanho_bytes  INTEGER NOT NULL,
-    status         TEXT NOT NULL DEFAULT 'RECEBIDO' CHECK (
-        status IN ('RECEBIDO', 'PROCESSANDO', 'PROCESSADO', 'ERRO', 'QUARENTENA')
-    ),
-    recebido_em    TEXT NOT NULL,
-    processado_em  TEXT,
-    FOREIGN KEY (tenant_id, cliente_id)
-        REFERENCES clientes(tenant_id, cliente_id),
-    UNIQUE (tenant_id, arquivo_hash)
-);
-
-CREATE TABLE IF NOT EXISTS extracoes_ia (
-    extracao_id   TEXT PRIMARY KEY,
-    tenant_id     TEXT NOT NULL,
-    documento_id  TEXT NOT NULL,
-    modelo        TEXT NOT NULL,
-    resposta_json TEXT NOT NULL,
-    status        TEXT NOT NULL CHECK (
-        status IN ('SUCESSO', 'PARCIAL', 'FALHA')
-    ),
-    criado_em     TEXT NOT NULL,
-    FOREIGN KEY (tenant_id, documento_id)
-        REFERENCES documentos(tenant_id, documento_id)
-);
-
-CREATE TABLE IF NOT EXISTS lancamentos (
-    lancamento_id       TEXT NOT NULL,
-    tenant_id           TEXT NOT NULL,
-    cliente_id          TEXT NOT NULL,
-    documento_id        TEXT,
-    extracao_id         TEXT,
-
-    chave_dedup         TEXT NOT NULL,
-    arquivo_hash        TEXT NOT NULL,
-    data                TEXT NOT NULL,
-    data_iso            TEXT NOT NULL,
-    descricao_original  TEXT NOT NULL,
-
-    valor_centavos      INTEGER NOT NULL CHECK (valor_centavos >= 0),
-    tipo                TEXT NOT NULL CHECK (tipo IN ('CREDITO', 'DEBITO')),
-    categoria           TEXT NOT NULL,
-    origem              TEXT NOT NULL,
-
-    requer_revisao      INTEGER NOT NULL DEFAULT 1,
-    status              TEXT NOT NULL DEFAULT 'PENDENTE' CHECK (
-        status IN ('PENDENTE', 'REVISADO', 'APROVADO', 'REJEITADO')
-    ),
-    criado_em           TEXT NOT NULL,
-
-    PRIMARY KEY (tenant_id, lancamento_id),
-    UNIQUE (tenant_id, chave_dedup),
-    FOREIGN KEY (tenant_id, cliente_id)
-        REFERENCES clientes(tenant_id, cliente_id),
-    FOREIGN KEY (tenant_id, documento_id)
-        REFERENCES documentos(tenant_id, documento_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_lancamentos_tenant_cliente_data
-ON lancamentos (tenant_id, cliente_id, data_iso DESC);
-
-CREATE INDEX IF NOT EXISTS idx_lancamentos_tenant_status
-ON lancamentos (tenant_id, status, requer_revisao);
-
-CREATE INDEX IF NOT EXISTS idx_documentos_tenant_cliente
-ON documentos (tenant_id, cliente_id, recebido_em DESC);
-
-CREATE TABLE IF NOT EXISTS quarentena (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id     TEXT NOT NULL,
-    cliente_id    TEXT NOT NULL,
-    ts            TEXT NOT NULL,
-    arquivo       TEXT,
-    arquivo_hash  TEXT,
-    item_json     TEXT,
-    erro_json     TEXT
-);
-
-CREATE TABLE IF NOT EXISTS auditoria_log (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id             TEXT NOT NULL,
-    usuario_id            TEXT,
-    ts                    TEXT NOT NULL,
-    evento                TEXT NOT NULL,
-    cliente_id            TEXT,
-    arquivo               TEXT,
-    hash_sha256           TEXT,
-    tipo                  TEXT,
-    status                TEXT,
-    total                 INTEGER,
-    consentimento_externo INTEGER,
-    destino               TEXT,
-    detalhe               TEXT,
-    hash_anterior         TEXT NOT NULL,
-    hash_registro         TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_auditoria_tenant_data
-ON auditoria_log (tenant_id, id DESC);
-
-CREATE TRIGGER IF NOT EXISTS auditoria_log_sem_update
-BEFORE UPDATE ON auditoria_log
-BEGIN
-    SELECT RAISE(ABORT, 'auditoria_log é append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS auditoria_log_sem_delete
-BEFORE DELETE ON auditoria_log
-BEGIN
-    SELECT RAISE(ABORT, 'auditoria_log é append-only');
-END;
-"""
-
-CAMPOS_LOG = (
-    "ts",
-    "evento",
-    "cliente_id",
-    "arquivo",
-    "hash_sha256",
-    "tipo",
-    "status",
-    "total",
-    "consentimento_externo",
-    "destino",
-    "detalhe",
+st.set_page_config(
+    page_title="Agente Contábil Multiempresa",
+    page_icon="💼",
+    layout="wide",
 )
 
-
-# =============================================================
-# CONEXÃO E TRANSAÇÃO
-# =============================================================
-
-def agora() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def conectar() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-@contextmanager
-def transacao():
-    conn = conectar()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
-        conn.execute("COMMIT")
-    except Exception:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
-
-
-def inicializar_banco():
-    conn = conectar()
-    try:
-        conn.executescript(SCHEMA_SQL)
-    finally:
-        conn.close()
+st.title("💼 Agente Contábil Multiempresa & Auditoria")
+st.markdown(
+    "Pipeline multiempresa com PostgreSQL, isolamento por tenant, "
+    "auditoria encadeada e revisão humana."
+)
 
 
 # =============================================================
 # AUTENTICAÇÃO
 # =============================================================
 
-def hash_senha(senha: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        senha.encode(),
-        bytes.fromhex(salt),
-        PBKDF2_ITERACOES,
-    ).hex()
-
-
-def criar_usuario(tenant_id, email, nome, senha, papel="ADMIN"):
-    salt = secrets.token_hex(16)
-    senha_hash = hash_senha(senha, salt)
-
-    with transacao() as conn:
-        conn.execute(
-            """
-            INSERT INTO usuarios
-            (usuario_id, tenant_id, email, nome, papel, senha_salt, senha_hash, criado_em)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                tenant_id,
-                email.lower(),
-                nome,
-                papel,
-                salt,
-                senha_hash,
-                agora(),
-            ),
-        )
-
-
 def autenticar(email: str, senha: str):
-    conn = conectar()
-    try:
+    with POOL.connection() as conn:
         usuario = conn.execute(
             """
             SELECT u.usuario_id, u.tenant_id, u.nome, u.papel,
-                   u.senha_salt, u.senha_hash, t.nome AS tenant_nome
+                   u.senha_salt, u.senha_hash, t.nome
             FROM usuarios u
             JOIN tenants t ON t.tenant_id = u.tenant_id
-            WHERE u.email = ? AND u.ativo = 1
+            WHERE u.email = %s AND u.ativo = true
             """,
             (email.lower().strip(),),
         ).fetchone()
-    finally:
-        conn.close()
 
     if not usuario:
         return None
@@ -394,102 +105,32 @@ def autenticar(email: str, senha: str):
 
 
 # =============================================================
-# AUDITORIA POR TENANT
+# VALIDAÇÃO
 # =============================================================
 
-def _hash_registro(anterior: str, registro: dict) -> str:
-    corpo = json.dumps(
-        registro,
-        sort_keys=True,
-        ensure_ascii=False,
-        default=str,
-    )
-    return hashlib.sha256(
-        f"{anterior}|{corpo}".encode("utf-8")
-    ).hexdigest()
+class LancamentoSchema(BaseModel):
+    data: str
+    descricao: str
+    valor: float
+    tipo: Literal["CREDITO", "DEBITO"]
+    categoria: Literal[
+        "Investimentos",
+        "Transferências",
+        "Impostos",
+        "Fornecedores",
+        "Despesas Operacionais",
+        "Outros",
+    ]
+
+    @field_validator("data")
+    @classmethod
+    def validar_data(cls, valor: str) -> str:
+        datetime.strptime(valor, "%d/%m/%Y")
+        return valor
 
 
-def registrar_log(
-    conn: sqlite3.Connection,
-    tenant_id: str,
-    usuario_id: str | None,
-    **campos,
-):
-    registro = {campo: campos.get(campo) for campo in CAMPOS_LOG}
-    registro["ts"] = registro["ts"] or agora()
-
-    if registro["total"] is not None:
-        registro["total"] = int(registro["total"])
-
-    if registro["consentimento_externo"] is not None:
-        registro["consentimento_externo"] = int(
-            bool(registro["consentimento_externo"])
-        )
-
-    anterior = conn.execute(
-        """
-        SELECT hash_registro
-        FROM auditoria_log
-        WHERE tenant_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (tenant_id,),
-    ).fetchone()
-
-    hash_anterior = anterior[0] if anterior else "GENESIS"
-
-    hash_registro = _hash_registro(hash_anterior, registro)
-
-    colunas = ", ".join(CAMPOS_LOG)
-    marcadores = ", ".join("?" for _ in CAMPOS_LOG)
-
-    conn.execute(
-        f"""
-        INSERT INTO auditoria_log
-        (tenant_id, usuario_id, {colunas}, hash_anterior, hash_registro)
-        VALUES (?, ?, {marcadores}, ?, ?)
-        """,
-        (
-            tenant_id,
-            usuario_id,
-            *registro.values(),
-            hash_anterior,
-            hash_registro,
-        ),
-    )
-
-
-def verificar_cadeia(tenant_id: str):
-    conn = conectar()
-    try:
-        linhas = conn.execute(
-            f"""
-            SELECT id, {', '.join(CAMPOS_LOG)},
-                   hash_anterior, hash_registro
-            FROM auditoria_log
-            WHERE tenant_id = ?
-            ORDER BY id
-            """,
-            (tenant_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    anterior = "GENESIS"
-
-    for id_, *valores, hash_ant, hash_reg in linhas:
-        registro = dict(zip(CAMPOS_LOG, valores))
-
-        if (
-            hash_ant != anterior
-            or _hash_registro(anterior, registro) != hash_reg
-        ):
-            return False, id_, len(linhas)
-
-        anterior = hash_reg
-
-    return True, None, len(linhas)
+class RelatorioContabilSchema(BaseModel):
+    lancamentos: list[LancamentoSchema]
 
 
 # =============================================================
@@ -529,97 +170,11 @@ def aplicar_mascara_lgpd(texto: str) -> str:
     return texto
 
 
-def sanitizar_erro(erro: Exception) -> str:
-    return re.sub(r"[^ws.,-]", "", str(erro))[:180]
-
-
-def normalizar_decimal(texto: str) -> str:
-    texto = texto.strip().replace(" ", "")
-
-    if "," in texto and "." in texto:
-        if texto.rfind(",") > texto.rfind("."):
-            return texto.replace(".", "").replace(",", ".")
-        return texto.replace(",", "")
-
-    return texto.replace(",", ".")
-
-
-def valor_para_centavos(valor_str: str) -> int:
-    dec = Decimal(normalizar_decimal(str(valor_str)))
-    return int(
-        (dec * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    )
-
-
-def formatar_brl(centavos: int) -> str:
-    centavos = int(centavos)
-    sinal = "-" if centavos < 0 else ""
-    valor = abs(centavos)
-    reais = f"{valor // 100:,}".replace(",", ".")
-    return f"{sinal}R$ {reais},{valor % 100:02d}"
-
-
-def decodificar_texto_ofx(bytes_arquivo: bytes) -> str:
+def decodificar_ofx(bytes_arquivo: bytes) -> str:
     try:
         return bytes_arquivo.decode("utf-8")
     except UnicodeDecodeError:
         return bytes_arquivo.decode("cp1252", errors="replace")
-
-
-def criar_lancamento(
-    tenant_id: str,
-    cliente_id: str,
-    arquivo_hash: str,
-    chave_dedup: str,
-    data: str,
-    descricao: str,
-    valor_centavos: int,
-    tipo: str,
-    categoria: str,
-    origem: str,
-) -> dict:
-    return {
-        "lancamento_id": str(uuid.uuid4()),
-        "tenant_id": tenant_id,
-        "cliente_id": cliente_id,
-        "chave_dedup": chave_dedup,
-        "arquivo_hash": arquivo_hash,
-        "data": data,
-        "descricao_original": html.unescape(descricao),
-        "valor_centavos": abs(int(valor_centavos)),
-        "tipo": tipo,
-        "categoria": categoria,
-        "origem": origem,
-    }
-
-
-# =============================================================
-# VALIDAÇÃO PYDANTIC
-# =============================================================
-
-class LancamentoSchema(BaseModel):
-    data: str
-    descricao: str
-    valor: float = Field(..., ge=0)
-    tipo: Literal["CREDITO", "DEBITO"]
-    categoria: Literal[
-        "Investimentos",
-        "Transferências",
-        "Impostos",
-        "Fornecedores",
-        "Despesas Operacionais",
-        "Outros",
-    ]
-
-    @field_validator("data")
-    @classmethod
-    def validar_data(cls, valor: str) -> str:
-        datetime.strptime(valor, "%d/%m/%Y")
-        return valor
-
-
-class RelatorioContabilSchema(BaseModel):
-    lancamentos: list[LancamentoSchema]
 
 
 # =============================================================
@@ -633,144 +188,140 @@ def parse_ofx(bytes_arquivo: bytes, arquivo_hash: str):
     chaves_locais = set()
     duplicados = 0
 
-    try:
-        conteudo = decodificar_texto_ofx(bytes_arquivo)
-        corpo = (
-            conteudo[conteudo.index("<OFX>"):]
-            if "<OFX>" in conteudo
-            else conteudo
+    conteudo = decodificar_ofx(bytes_arquivo)
+    corpo = (
+        conteudo[conteudo.index("<OFX>"):]
+        if "<OFX>" in conteudo
+        else conteudo
+    )
+
+    blocos = [
+        match.group(2)
+        for match in re.finditer(
+            r"<(STMTRS|CCSTMTRS)>(.*?)</\u0001>",
+            corpo,
+            re.DOTALL,
+        )
+    ] or [corpo]
+
+    indice = 0
+
+    for bloco in blocos:
+        bank = re.search(r"<BANKID>([^<
+]+)", bloco)
+        acct = re.search(r"<ACCTID>([^<
+]+)", bloco)
+
+        bank_id = bank.group(1).strip() if bank else "UNKNOWN_BANK"
+        acct_id = acct.group(1).strip() if acct else "UNKNOWN_ACCT"
+
+        if "UNKNOWN_" in (bank_id, acct_id):
+            avisos.append(
+                "Metadados bancários incompletos; "
+                "deduplicação por FITID/hash."
+            )
+
+        transacoes = re.findall(
+            r"<STMTTRN>(.*?)(?=<STMTTRN>|</BANKTRANLIST>|$)",
+            bloco,
+            re.DOTALL,
         )
 
-        blocos = [
-            match.group(2)
-            for match in re.finditer(
-                r"<(STMTRS|CCSTMTRS)>(.*?)</\u0001>",
-                corpo,
-                re.DOTALL,
-            )
-        ] or [corpo]
+        ocorrencias = {}
 
-        indice = 0
+        for transacao in transacoes:
+            indice += 1
 
-        for bloco in blocos:
-            bank = re.search(r"<BANKID>([^<
-]+)", bloco)
-            acct = re.search(r"<ACCTID>([^<
-]+)", bloco)
+            try:
+                data_m = re.search(r"<DTPOSTED>(d{8})", transacao)
+                valor_m = re.search(r"<TRNAMT>([^<
+]+)", transacao)
+                memo_m = re.search(r"<MEMO>([^<
+]+)", transacao)
+                nome_m = re.search(r"<NAME>([^<
+]+)", transacao)
+                fitid_m = re.search(r"<FITID>([^<
+]+)", transacao)
 
-            bank_id = bank.group(1).strip() if bank else "UNKNOWN_BANK"
-            acct_id = acct.group(1).strip() if acct else "UNKNOWN_ACCT"
+                if not data_m or not valor_m:
+                    raise ValueError("Sem DTPOSTED ou TRNAMT")
 
-            if "UNKNOWN_" in (bank_id, acct_id):
-                avisos.append(
-                    "Metadados bancários incompletos; "
-                    "deduplicação baseada em FITID/hash."
+                data_bruta = data_m.group(1)
+                data_iso = (
+                    f"{data_bruta[0:4]}-"
+                    f"{data_bruta[4:6]}-"
+                    f"{data_bruta[6:8]}"
+                )
+                datetime.strptime(data_iso, "%Y-%m-%d")
+
+                centavos = valor_para_centavos(valor_m.group(1))
+                tipo = "CREDITO" if centavos >= 0 else "DEBITO"
+
+                descricao = (
+                    memo_m.group(1).strip()
+                    if memo_m
+                    else nome_m.group(1).strip()
+                    if nome_m
+                    else "Transação OFX"
                 )
 
-            transacoes = re.findall(
-                r"<STMTTRN>(.*?)(?=<STMTTRN>|</BANKTRANLIST>|$)",
-                bloco,
-                re.DOTALL,
-            )
-
-            ocorrencias = {}
-
-            for transacao in transacoes:
-                indice += 1
-
-                try:
-                    data_m = re.search(r"<DTPOSTED>(d{8})", transacao)
-                    valor_m = re.search(r"<TRNAMT>([^<
-]+)", transacao)
-                    memo_m = re.search(r"<MEMO>([^<
-]+)", transacao)
-                    nome_m = re.search(r"<NAME>([^<
-]+)", transacao)
-                    fitid_m = re.search(r"<FITID>([^<
-]+)", transacao)
-
-                    if not data_m or not valor_m:
-                        raise ValueError("Sem DTPOSTED ou TRNAMT")
-
-                    data_bruta = data_m.group(1)
-                    data_fmt = (
-                        f"{data_bruta[6:8]}/"
-                        f"{data_bruta[4:6]}/"
-                        f"{data_bruta[0:4]}"
+                if fitid_m:
+                    chave = (
+                        f"{bank_id}|{acct_id}|"
+                        f"{fitid_m.group(1).strip()}"
                     )
-                    datetime.strptime(data_fmt, "%d/%m/%Y")
-
-                    centavos = valor_para_centavos(valor_m.group(1))
-                    tipo = "CREDITO" if centavos >= 0 else "DEBITO"
-
-                    descricao = (
-                        memo_m.group(1).strip()
-                        if memo_m
-                        else nome_m.group(1).strip()
-                        if nome_m
-                        else "Transação OFX"
+                else:
+                    assinatura = (
+                        f"{data_bruta}|{centavos}|{descricao}"
+                    )
+                    ocorrencias[assinatura] = (
+                        ocorrencias.get(assinatura, 0) + 1
                     )
 
-                    if fitid_m:
-                        chave = (
-                            f"{bank_id}|{acct_id}|"
-                            f"{fitid_m.group(1).strip()}"
-                        )
-                    else:
-                        assinatura = (
-                            f"{data_bruta}|{centavos}|{descricao}"
-                        )
-                        ocorrencias[assinatura] = (
-                            ocorrencias.get(assinatura, 0) + 1
-                        )
+                    hash_local = hashlib.sha256(
+                        f"{bank_id}|{acct_id}|{assinatura}|"
+                        f"{ocorrencias[assinatura]}".encode()
+                    ).hexdigest()
 
-                        hash_local = hashlib.sha256(
-                            f"{bank_id}|{acct_id}|{assinatura}|"
-                            f"{ocorrencias[assinatura]}".encode()
-                        ).hexdigest()
+                    chave = f"{bank_id}|{acct_id}|HASH-{hash_local}"
 
-                        chave = f"{bank_id}|{acct_id}|HASH-{hash_local}"
+                if chave in chaves_locais:
+                    duplicados += 1
+                    continue
 
-                    if chave in chaves_locais:
-                        duplicados += 1
-                        continue
+                categoria = (
+                    "Transferências"
+                    if centavos < 0
+                    else "Outros"
+                )
 
-                    categoria = (
-                        "Transferências"
-                        if centavos < 0
-                        else "Outros"
-                    )
+                descricao_upper = descricao.upper()
 
-                    descricao_upper = descricao.upper()
+                if "INVEST" in descricao_upper or re.search(
+                    r"\bB3\b", descricao_upper
+                ):
+                    categoria = "Investimentos"
+                elif "IMPOSTO" in descricao_upper or "IOF" in descricao_upper:
+                    categoria = "Impostos"
 
-                    if "INVEST" in descricao_upper or re.search(
-                        r"\bB3\b", descricao_upper
-                    ):
-                        categoria = "Investimentos"
-                    elif "IMPOSTO" in descricao_upper or "IOF" in descricao_upper:
-                        categoria = "Impostos"
+                lancamentos.append(
+                    {
+                        "chave_dedup": chave,
+                        "arquivo_hash": arquivo_hash,
+                        "data_iso": data_iso,
+                        "descricao_original": html.unescape(descricao),
+                        "valor_centavos": abs(centavos),
+                        "tipo": tipo,
+                        "categoria": categoria,
+                        "origem": "OFX local",
+                    }
+                )
+                chaves_locais.add(chave)
 
-                    lancamentos.append(
-                        {
-                            "chave_dedup": chave,
-                            "arquivo_hash": arquivo_hash,
-                            "data": data_fmt,
-                            "descricao_original": descricao,
-                            "valor_centavos": abs(centavos),
-                            "tipo": tipo,
-                            "categoria": categoria,
-                            "origem": "OFX local",
-                        }
-                    )
-                    chaves_locais.add(chave)
+            except Exception as erro:
+                erros.append(f"Transação {indice}: {erro}")
 
-                except Exception as erro:
-                    erros.append(f"Transação {indice}: {erro}")
-
-        return lancamentos, erros, avisos, duplicados
-
-    except Exception as erro:
-        return [], [f"Erro crítico no OFX: {erro}"], avisos, 0
+    return lancamentos, erros, avisos, duplicados
 
 
 # =============================================================
@@ -778,7 +329,7 @@ def parse_ofx(bytes_arquivo: bytes, arquivo_hash: str):
 # =============================================================
 
 PROMPT_EXTRACAO = """
-Analise este documento financeiro e extraia todos os lançamentos.
+Extraia todos os lançamentos financeiros do documento.
 Não invente lançamentos.
 Se não houver transações claras, retorne lista vazia.
 Ignore saldos, totais e subtotais.
@@ -816,11 +367,11 @@ def chamar_gemini(client, bytes_data: bytes, mime_tipo: str):
 
 
 # =============================================================
-# PERSISTÊNCIA MULTIEMPRESA
+# PERSISTÊNCIA
 # =============================================================
 
 def inserir_lancamentos(
-    conn: sqlite3.Connection,
+    conn,
     tenant_id: str,
     cliente_id: str,
     lancamentos: list[dict],
@@ -830,64 +381,64 @@ def inserir_lancamentos(
     for lancamento in lancamentos:
         cursor = conn.execute(
             """
-            INSERT OR IGNORE INTO lancamentos
-            (
-                lancamento_id, tenant_id, cliente_id,
-                chave_dedup, arquivo_hash, data, data_iso,
-                descricao_original, valor_centavos, tipo,
-                categoria, origem, requer_revisao, status, criado_em
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDENTE', ?)
-            """,
-            (
-                str(uuid.uuid4()),
+            INSERT INTO lancamentos (
                 tenant_id,
                 cliente_id,
+                lancamento_id,
+                chave_dedup,
+                arquivo_hash,
+                data_iso,
+                descricao_original,
+                valor_centavos,
+                tipo,
+                categoria,
+                origem
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, chave_dedup) DO NOTHING
+            """,
+            (
+                tenant_id,
+                cliente_id,
+                str(uuid.uuid4()),
                 lancamento["chave_dedup"],
                 lancamento["arquivo_hash"],
-                lancamento["data"],
-                datetime.strptime(
-                    lancamento["data"], "%d/%m/%Y"
-                ).strftime("%Y-%m-%d"),
+                lancamento["data_iso"],
                 lancamento["descricao_original"],
                 lancamento["valor_centavos"],
                 lancamento["tipo"],
                 lancamento["categoria"],
                 lancamento["origem"],
-                agora(),
             ),
         )
+
         inseridos += cursor.rowcount
 
     return inseridos, len(lancamentos) - inseridos
 
 
 def carregar_livro(tenant_id: str, cliente_id: str) -> pd.DataFrame:
-    conn = conectar()
-    try:
+    with POOL.connection() as conn:
         df = pd.read_sql_query(
             """
-            SELECT lancamento_id, arquivo_hash, data,
+            SELECT lancamento_id, arquivo_hash, data_iso AS data,
                    descricao_original, valor_centavos AS valor,
                    tipo, categoria, origem, requer_revisao
             FROM lancamentos
-            WHERE tenant_id = ? AND cliente_id = ?
-            ORDER BY data_iso, rowid
+            WHERE tenant_id = %s AND cliente_id = %s
+            ORDER BY data_iso DESC
             """,
             conn,
             params=(tenant_id, cliente_id),
         )
-    finally:
-        conn.close()
 
     if df.empty:
         return df
 
     df["requer_revisao"] = df["requer_revisao"].astype(bool)
     df["valor"] = df["valor"].astype("int64")
-    df["valor_assinado"] = np.where(
+    df["valor_assinado"] = df["valor"].where(
         df["tipo"] == "CREDITO",
-        df["valor"],
         -df["valor"],
     )
     df["possivel_duplicata"] = df.duplicated(
@@ -898,60 +449,34 @@ def carregar_livro(tenant_id: str, cliente_id: str) -> pd.DataFrame:
 
 
 def carregar_log(tenant_id: str, limite: int = 300) -> pd.DataFrame:
-    conn = conectar()
-    try:
+    with POOL.connection() as conn:
         return pd.read_sql_query(
             """
-            SELECT id, ts, evento, arquivo, tipo, status,
-                   total, destino, substr(hash_registro, 1, 12) AS hash_registro
+            SELECT log_id, criado_em AS ts, evento, arquivo, tipo,
+                   status, total, destino,
+                   substring(hash_registro from 1 for 12) AS hash_registro
             FROM auditoria_log
-            WHERE tenant_id = ?
-            ORDER BY id DESC
-            LIMIT ?
+            WHERE tenant_id = %s
+            ORDER BY log_id DESC
+            LIMIT %s
             """,
             conn,
             params=(tenant_id, limite),
         )
-    finally:
-        conn.close()
 
 
 def carregar_quarentena(tenant_id: str, cliente_id: str) -> pd.DataFrame:
-    conn = conectar()
-    try:
+    with POOL.connection() as conn:
         return pd.read_sql_query(
             """
-            SELECT id, ts, arquivo, item_json, erro_json
+            SELECT id, criado_em AS ts, arquivo, item_json, erro_json
             FROM quarentena
-            WHERE tenant_id = ? AND cliente_id = ?
+            WHERE tenant_id = %s AND cliente_id = %s
             ORDER BY id DESC
             """,
             conn,
             params=(tenant_id, cliente_id),
         )
-    finally:
-        conn.close()
-
-
-def arquivo_ia_ja_processado(
-    conn: sqlite3.Connection,
-    tenant_id: str,
-    cliente_id: str,
-    arquivo_hash: str,
-) -> bool:
-    resultado = conn.execute(
-        """
-        SELECT 1
-        FROM documentos
-        WHERE tenant_id = ?
-          AND cliente_id = ?
-          AND arquivo_hash = ?
-          AND status = 'PROCESSADO'
-        """,
-        (tenant_id, cliente_id, arquivo_hash),
-    ).fetchone()
-
-    return resultado is not None
 
 
 # =============================================================
@@ -965,13 +490,15 @@ def processar_upload(
     uploaded_files,
     consentimento: bool,
 ):
+    api_key = st.secrets.get("GEMINI_API_KEY")
+
     if not api_key:
         st.error("Credencial Gemini não configurada.")
         return
 
     client = genai.Client(api_key=api_key)
 
-    with transacao() as conn:
+    with transacao(tenant_id) as conn:
         for arquivo in uploaded_files:
             bytes_arquivo = arquivo.getvalue()
             nome_arquivo = arquivo.name
@@ -992,13 +519,16 @@ def processar_upload(
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO documentos
-                (
+                INSERT INTO documentos (
                     documento_id, tenant_id, cliente_id, origem,
                     tipo_documento, nome_arquivo, arquivo_hash,
-                    mime_type, tamanho_bytes, status, recebido_em
+                    mime_type, tamanho_bytes, status
                 )
-                VALUES (?, ?, ?, 'UPLOAD', 'OUTRO', ?, ?, ?, ?, 'PROCESSANDO', ?)
+                VALUES (
+                    %s, %s, %s, 'UPLOAD', 'OUTRO',
+                    %s, %s, %s, %s, 'PROCESSANDO'
+                )
+                ON CONFLICT (tenant_id, arquivo_hash) DO NOTHING
                 """,
                 (
                     documento_id,
@@ -1008,7 +538,6 @@ def processar_upload(
                     arquivo_hash,
                     mime,
                     len(bytes_arquivo),
-                    agora(),
                 ),
             )
 
@@ -1025,19 +554,15 @@ def processar_upload(
                     lancamentos,
                 )
 
-                status = (
-                    "PROCESSADO"
-                    if not erros
-                    else "QUARENTENA"
-                )
+                status = "PROCESSADO" if not erros else "QUARENTENA"
 
                 conn.execute(
                     """
                     UPDATE documentos
-                    SET status = ?, processado_em = ?
-                    WHERE tenant_id = ? AND documento_id = ?
+                    SET status = %s, processado_em = now()
+                    WHERE tenant_id = %s AND documento_id = %s
                     """,
-                    (status, agora(), tenant_id, documento_id),
+                    (status, tenant_id, documento_id),
                 )
 
                 registrar_log(
@@ -1047,7 +572,7 @@ def processar_upload(
                     evento="IMPORTACAO_OFX",
                     cliente_id=cliente_id,
                     arquivo=nome_arquivo,
-                    hash_sha256=arquivo_hash,
+                    arquivo_hash=arquivo_hash,
                     tipo="OFX local",
                     status=status,
                     total=inseridos,
@@ -1061,17 +586,22 @@ def processar_upload(
                 )
 
                 if erros:
-                    st.warning(
-                        f"{nome_arquivo}: {erros[0]}"
-                    )
+                    st.warning(f"{nome_arquivo}: {erros[0]}")
 
             else:
-                if arquivo_ia_ja_processado(
-                    conn,
-                    tenant_id,
-                    cliente_id,
-                    arquivo_hash,
-                ):
+                ja_processado = conn.execute(
+                    """
+                    SELECT 1
+                    FROM documentos
+                    WHERE tenant_id = %s
+                      AND cliente_id = %s
+                      AND arquivo_hash = %s
+                      AND status = 'PROCESSADO'
+                    """,
+                    (tenant_id, cliente_id, arquivo_hash),
+                ).fetchone()
+
+                if ja_processado:
                     st.info(f"Arquivo já processado: {nome_arquivo}")
                     continue
 
@@ -1087,10 +617,11 @@ def processar_upload(
 
                     conn.execute(
                         """
-                        INSERT INTO extracoes_ia
-                        (extracao_id, tenant_id, documento_id,
-                         modelo, resposta_json, status, criado_em)
-                        VALUES (?, ?, ?, ?, ?, 'SUCESSO', ?)
+                        INSERT INTO extracoes_ia (
+                            extracao_id, tenant_id, documento_id,
+                            modelo, resposta_json, status
+                        )
+                        VALUES (%s, %s, %s, %s, %s, 'SUCESSO')
                         """,
                         (
                             extracao_id,
@@ -1098,7 +629,6 @@ def processar_upload(
                             documento_id,
                             MODELO_GEMINI,
                             resposta.text,
-                            agora(),
                         ),
                     )
 
@@ -1121,10 +651,12 @@ def processar_upload(
                                 {
                                     "chave_dedup": f"IA|{chave_item}",
                                     "arquivo_hash": arquivo_hash,
-                                    "data": lancamento.data,
+                                    "data_iso": datetime.strptime(
+                                        lancamento.data, "%d/%m/%Y"
+                                    ).strftime("%Y-%m-%d"),
                                     "descricao_original": lancamento.descricao,
                                     "valor_centavos": valor_para_centavos(
-                                        str(lancamento.valor)
+                                        lancamento.valor
                                     ),
                                     "tipo": lancamento.tipo,
                                     "categoria": lancamento.categoria,
@@ -1137,25 +669,20 @@ def processar_upload(
 
                             conn.execute(
                                 """
-                                INSERT INTO quarentena
-                                (tenant_id, cliente_id, ts, arquivo,
-                                 arquivo_hash, item_json, erro_json)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                INSERT INTO quarentena (
+                                    tenant_id, cliente_id, arquivo,
+                                    arquivo_hash, item_json, erro_json
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s)
                                 """,
                                 (
                                     tenant_id,
                                     cliente_id,
-                                    agora(),
                                     nome_arquivo,
                                     arquivo_hash,
-                                    json.dumps(
-                                        item,
-                                        ensure_ascii=False,
-                                        default=str,
-                                    ),
+                                    json.dumps(item, default=str),
                                     json.dumps(
                                         erro.errors(include_url=False),
-                                        ensure_ascii=False,
                                         default=str,
                                     ),
                                 ),
@@ -1168,7 +695,7 @@ def processar_upload(
                         validos,
                     )
 
-                    status_documento = (
+                    status = (
                         "PROCESSADO"
                         if rejeitados == 0
                         else "QUARENTENA"
@@ -1177,15 +704,10 @@ def processar_upload(
                     conn.execute(
                         """
                         UPDATE documentos
-                        SET status = ?, processado_em = ?
-                        WHERE tenant_id = ? AND documento_id = ?
+                        SET status = %s, processado_em = now()
+                        WHERE tenant_id = %s AND documento_id = %s
                         """,
-                        (
-                            status_documento,
-                            agora(),
-                            tenant_id,
-                            documento_id,
-                        ),
+                        (status, tenant_id, documento_id),
                     )
 
                     registrar_log(
@@ -1195,9 +717,9 @@ def processar_upload(
                         evento="EXTRACAO_IA",
                         cliente_id=cliente_id,
                         arquivo=nome_arquivo,
-                        hash_sha256=arquivo_hash,
+                        arquivo_hash=arquivo_hash,
                         tipo="Gemini IA",
-                        status=status_documento,
+                        status=status,
                         total=inseridos,
                         consentimento_externo=True,
                         destino="Google Gemini API",
@@ -1217,10 +739,10 @@ def processar_upload(
                     conn.execute(
                         """
                         UPDATE documentos
-                        SET status = 'ERRO', processado_em = ?
-                        WHERE tenant_id = ? AND documento_id = ?
+                        SET status = 'ERRO', processado_em = now()
+                        WHERE tenant_id = %s AND documento_id = %s
                         """,
-                        (agora(), tenant_id, documento_id),
+                        (tenant_id, documento_id),
                     )
 
                     registrar_log(
@@ -1230,42 +752,26 @@ def processar_upload(
                         evento="EXTRACAO_IA_FALHA",
                         cliente_id=cliente_id,
                         arquivo=nome_arquivo,
-                        hash_sha256=arquivo_hash,
+                        arquivo_hash=arquivo_hash,
                         tipo="Gemini IA",
                         status="ERRO",
                         total=0,
                         consentimento_externo=True,
                         destino="Google Gemini API",
-                        detalhe=sanitizar_erro(erro),
+                        detalhe=str(erro)[:180],
                     )
 
-                    st.error(
-                        f"Erro ao processar {nome_arquivo}: "
-                        f"{sanitizar_erro(erro)}"
-                    )
+                    st.error(f"Erro ao processar {nome_arquivo}.")
 
     st.success("Processamento concluído e persistido.")
 
 
 # =============================================================
-# ESTADO E BOOTSTRAP
+# INTERFACE
 # =============================================================
 
-def inicializar_estado():
-    if "usuario" not in st.session_state:
-        st.session_state["usuario"] = None
-
-    if "cliente_id" not in st.session_state:
-        st.session_state["cliente_id"] = None
-
-
-inicializar_estado()
-inicializar_banco()
-
-
-# =============================================================
-# LOGIN
-# =============================================================
+if "usuario" not in st.session_state:
+    st.session_state["usuario"] = None
 
 if st.session_state["usuario"] is None:
     st.subheader("🔐 Acesso ao escritório")
@@ -1286,44 +792,36 @@ if st.session_state["usuario"] is None:
 
     st.stop()
 
-
 usuario = st.session_state["usuario"]
 tenant_id = usuario["tenant_id"]
-
-
-# =============================================================
-# SELEÇÃO DE CLIENTE
-# =============================================================
 
 with st.sidebar:
     st.header("🏢 Escritório")
     st.write(f"**{usuario['tenant_nome']}**")
-    st.write(f"Usuário: {usuario['nome']} ({usuario['papel']})")
+    st.write(f"{usuario['nome']} — {usuario['papel']}")
 
-    conn = conectar()
-    clientes = conn.execute(
-        """
-        SELECT cliente_id, razao_social
-        FROM clientes
-        WHERE tenant_id = ? AND ativo = 1
-        ORDER BY razao_social
-        """,
-        (tenant_id,),
-    ).fetchall()
-    conn.close()
+    with POOL.connection() as conn:
+        clientes = conn.execute(
+            """
+            SELECT cliente_id, razao_social
+            FROM clientes
+            WHERE tenant_id = %s AND ativo = true
+            ORDER BY razao_social
+            """,
+            (tenant_id,),
+        ).fetchall()
 
     if not clientes:
         st.warning("Nenhum cliente cadastrado.")
         st.stop()
 
-    cliente_selecionado = st.selectbox(
+    cliente = st.selectbox(
         "Cliente ativo",
         clientes,
         format_func=lambda c: c[1],
     )
 
-    st.session_state["cliente_id"] = cliente_selecionado[0]
-    cliente_id = st.session_state["cliente_id"]
+    cliente_id = cliente[0]
 
     st.markdown("---")
 
@@ -1362,10 +860,6 @@ if processar:
             uploaded_files,
             aviso_lgpd,
         )
-
-# =============================================================
-# DASHBOARD
-# =============================================================
 
 livro = carregar_livro(tenant_id, cliente_id)
 
@@ -1440,8 +934,6 @@ df_tabela = df_exibicao[
     ]
 ].rename(columns={"descricao_exibicao": "descricao"})
 
-st.session_state["df_editor_base"] = df_tabela
-
 st.data_editor(
     df_tabela,
     column_config={
@@ -1470,5 +962,4 @@ st.data_editor(
     ],
     use_container_width=True,
     key="editor_livro_contabil",
-    on_change=lambda: None,
 )
